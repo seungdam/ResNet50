@@ -470,7 +470,6 @@ class ResourceFactory:
             data = json.load(f)
         return int(len(data))
 
-
     @staticmethod
     def load_model(
         checkpoint_path: Path,
@@ -481,24 +480,34 @@ class ResourceFactory:
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-        from model_single_task_learning import resnet50
+        from model_single_task_learning_team import ResNet50Classifier
 
-        loaded = torch.load(checkpoint_path, map_location=device)
+        try:
+            loaded = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        except TypeError:
+            loaded = torch.load(checkpoint_path, map_location=device)
         state_dict = loaded
-        if isinstance(loaded, dict) and "state_dict" in loaded:
-            state_dict = loaded["state_dict"]
+        if isinstance(loaded, dict):
+            for key in ("state_dict", "model_state_dict"):
+                if key in loaded and isinstance(loaded[key], dict):
+                    state_dict = loaded[key]
+                    break
         if not isinstance(state_dict, dict):
             raise ValueError(
                 "Checkpoint format not supported. Please pass a state_dict-based checkpoint."
             )
-        if any(k.startswith("backbone.") for k in state_dict.keys()):
-            raise ValueError(
-                "Team wrapper checkpoint(backbone./classifier.) is not supported here. "
-                "Please use custom ResNet checkpoint keys(conv1/layer*/fc*)."
-            )
 
-        model = resnet50(img_channels=3, num_classes=num_classes, dropout_p=dropout)
-        model.load_state_dict(state_dict, strict=False)
+        model = ResNet50Classifier(
+            num_classes=int(num_classes),
+            dropout=float(dropout),
+            pretrained=False,
+        )
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if len(missing) > 0 or len(unexpected) > 0:
+            print(
+                f"[WARN] state_dict mismatch | missing={len(missing)}, unexpected={len(unexpected)}"
+            )
         model.to(device)
         model.eval()
         return model
@@ -506,25 +515,23 @@ class ResourceFactory:
     @staticmethod
     def create_infer_transform(
         image_size: int,
-        transform_profile: str = "team",
-        mean: Sequence[float] = (0.485, 0.456, 0.406),
-        std: Sequence[float] = (0.229, 0.224, 0.225),
     ) -> transforms.Compose:
-        if transform_profile.lower() == "team":
-            resize_size = (2 * image_size, image_size)
-        elif transform_profile.lower() == "square":
-            resize_size = (image_size, image_size)
-        else:
-            raise ValueError("transform_profile must be one of ['team', 'square']")
+        """
+        학습 시 사용한 전처리와 동일한 transform 을 반환.
+        resize = (2 * image_size, image_size)
+        mean/std = ImageNet (0.485, 0.456, 0.406) / (0.229, 0.224, 0.225)
+        """
+        resize_size = (2 * image_size, image_size)
+        mean = (0.485, 0.456, 0.406)
+        std  = (0.229, 0.224, 0.225)
+        
 
-        return transforms.Compose(
-            [
-                transforms.Resize(resize_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=mean, std=std),
-            ]
-        )
-
+        return transforms.Compose([
+            transforms.Resize(resize_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+    
     @classmethod
     def build_loaded_resources(
         cls,
@@ -538,7 +545,6 @@ class ResourceFactory:
         num_classes: int,
         device_name: str,
         image_size: int,
-        transform_profile: str,
         dropout: float = DEFAULT_DROPOUT,
     ) -> LoadedResources:
         device = torch.device(device_name if torch.cuda.is_available() or device_name == "cpu" else "cpu")
@@ -557,10 +563,7 @@ class ResourceFactory:
             device=device,
             dropout=dropout,
         )
-        infer_transform = cls.create_infer_transform(
-            image_size=image_size,
-            transform_profile=transform_profile,
-        )
+        infer_transform = cls.create_infer_transform(image_size=image_size)
         survey_profile: Optional[SurveyProfile] = None
         if use_survey_csv_prior and survey_csv.strip():
             survey_profile = cls.build_survey_profile(
@@ -766,7 +769,6 @@ class StreamlitRecommendationApp:
             num_classes_: int,
             device_name_: str,
             image_size_: int,
-            transform_profile_: str,
         ) -> LoadedResources:
             return ResourceFactory.build_loaded_resources(
                 metadata_csv=metadata_csv_,
@@ -779,7 +781,6 @@ class StreamlitRecommendationApp:
                 num_classes=num_classes_,
                 device_name=device_name_,
                 image_size=image_size_,
-                transform_profile=transform_profile_,
                 dropout=ResourceFactory.DEFAULT_DROPOUT,
             )
 
@@ -788,16 +789,15 @@ class StreamlitRecommendationApp:
             try:
                 loaded = _cached_load(
                     settings["metadata_csv"],
-                    settings["embeddings_npy"], # 燁삳똾源됪에?볥젃 ???筌왖??쇱벥 feature vector
+                    settings["embeddings_npy"],
                     settings["faiss_index"],
-                    settings["model_checkpoint"],# 筌뤴뫀??揶쎛餓λ쵐??
+                    settings["model_checkpoint"],
                     settings["label_map_json"],
-                    settings["survey_csv"], # ??뿅??怨쀪텢 野껉퀗??
+                    settings["survey_csv"], 
                     bool(settings["use_survey_csv_prior"]), 
-                    int(settings["num_classes"]),# ??곌볼 嚥≪뮆諭???쎈솭??揶쎛?紐꾩궞 ??됱뇚筌ｌ꼶??????
-                    settings["device_name"], # ?곕뗀以?筌뤴뫀諭?
-                    int(settings["image_size"]), # ???筌왖 ??由?
-                    settings["transform_profile"], # ?곕뗀以?????transform
+                    int(settings["num_classes"]),
+                    settings["device_name"], 
+                    int(settings["image_size"])
                 )
             except Exception as e:
                 st.error(f"Resource loading failed: {e}")
@@ -831,7 +831,6 @@ class StreamlitRecommendationApp:
             st.divider()
             num_classes = st.number_input("Fallback num_classes", min_value=2, value=31, step=1)
             image_size = st.number_input("Image size", min_value=112, max_value=512, value=224, step=16)
-            transform_profile = st.selectbox("Transform profile", ["custom", "square"], index=0)
             use_survey_csv_prior = st.checkbox("Use survey CSV prior vector", value=True)
             device_name = st.selectbox("Device", ["cuda", "cpu"], index=0 if torch.cuda.is_available() else 1)
             st.divider()
@@ -847,7 +846,6 @@ class StreamlitRecommendationApp:
             "catalog_root_text": catalog_root_text,
             "num_classes": int(num_classes),
             "image_size": int(image_size),
-            "transform_profile": transform_profile,
             "use_survey_csv_prior": bool(use_survey_csv_prior),
             "device_name": device_name,
             "preview_mode": bool(preview_mode),
@@ -954,8 +952,7 @@ class StreamlitRecommendationApp:
             if path_text and Path(path_text).exists():
                 st.image(path_text, caption=f"rank={int(row['rank'])}, score={row['score']:.4f}", width=260)
 
-
-    # Render Preview Cite
+    # Render Preview
     def _render_preview_results(
         self,
         top_k: int,
