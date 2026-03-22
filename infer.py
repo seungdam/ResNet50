@@ -11,26 +11,16 @@ from PIL import Image
 from torchvision import transforms
 
 try:
-    from model_single_task_learning import resnet50
+    from model_single_task_learning_team import ResNet50Classifier # 여기는 본인 걸로 바꾸기
 except ImportError:
-    print("[ERROR] model_single_task_learning.py를 찾을 수 없습니다.")
+    print("[ERROR] model_single_task_learning_team.py를 찾을 수 없습니다.")
     sys.exit(1)
 
 
-def build_transform(image_size: int, profile: str) -> transforms.Compose:
-    """Transform profile compatible with make_vector_db.py and app.py."""
-    profile = profile.lower().strip()
-    if profile == "team":
-        resize = (2 * image_size, image_size)
-        mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-    elif profile == "square":
-        resize = (image_size, image_size)
-        mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-    elif profile == "legacy":
-        resize = (int(round(image_size * 4 / 3)), image_size)
-        mean, std = (0.5498, 0.5226, 0.5052), (0.2600, 0.2582, 0.2620)
-    else:
-        raise ValueError("transform profile must be one of: team, square, legacy")
+def build_transform(image_size: int) -> transforms.Compose:
+    """Transform compatible with team model training/inference path."""
+    resize = (2 * image_size, image_size)
+    mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
     return transforms.Compose(
         [
@@ -42,10 +32,12 @@ def build_transform(image_size: int, profile: str) -> transforms.Compose:
 
 
 def _extract_state_dict(loaded_obj: object) -> Dict[str, torch.Tensor]:
-    if isinstance(loaded_obj, dict) and "state_dict" in loaded_obj:
-        state = loaded_obj["state_dict"]
-    else:
-        state = loaded_obj
+    state = loaded_obj
+    if isinstance(loaded_obj, dict):
+        for key in ["state_dict", "model_state_dict"]:
+            if key in loaded_obj and isinstance(loaded_obj[key], dict):
+                state = loaded_obj[key]
+                break
 
     if not isinstance(state, dict):
         raise ValueError("Checkpoint format not supported. Expected state_dict or {'state_dict': ...}.")
@@ -65,15 +57,17 @@ def load_model_and_labels(
     index_to_label = {v: k for k, v in label_to_index.items()}
     num_classes = len(label_to_index)
 
-    model = resnet50(img_channels=3, num_classes=num_classes, dropout_p=dropout)
-    loaded_obj = torch.load(model_path, map_location=device)
-    state_dict = _extract_state_dict(loaded_obj)
+    model = ResNet50Classifier(
+        num_classes=num_classes,
+        dropout=dropout,
+        pretrained=False,
+    )
 
-    if any(k.startswith("backbone.") for k in state_dict.keys()):
-        raise ValueError(
-            "ResNet50Classifier(backbone/classifier) 체크포인트는 이 스크립트에서 지원하지 않습니다. "
-            "model_single_task_learning.resnet50용 state_dict를 사용하세요."
-        )
+    try:
+        loaded_obj = torch.load(model_path, map_location=device, weights_only=True)
+    except TypeError:
+        loaded_obj = torch.load(model_path, map_location=device)
+    state_dict = _extract_state_dict(loaded_obj)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if len(missing) > 0 or len(unexpected) > 0:
@@ -141,7 +135,7 @@ def infer_folder(
 ) -> None:
     root = Path(image_dir)
     paths = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
-    print(f"[Infer] {len(paths)}장 추론 시작")
+    print(f"[Infer] {len(paths)}개 추론 시작")
 
     rows: List[Dict[str, str]] = []
     for i, path in enumerate(paths, 1):
@@ -191,7 +185,7 @@ def infer_folder(
             )
             writer.writeheader()
             writer.writerows(rows)
-        print(f"[Save] {output_csv}  ({len(rows)}행)")
+        print(f"[Save] {output_csv}  ({len(rows)}개)")
     else:
         print("\n[결과 요약]")
         for r in rows[:20]:
@@ -201,30 +195,22 @@ def infer_folder(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ResNet50 패션 스타일 추론")
+    parser = argparse.ArgumentParser(description="ResNet50 패션 스타일 추론 (team model 전용)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--image", help="단일 이미지 경로")
     group.add_argument("--image-dir", help="폴더 전체 추론")
-
     parser.add_argument("--model", required=True, help="best_model_state.pth 경로")
     parser.add_argument("--label-map", required=True, help="label_to_index.json 경로")
     parser.add_argument("--output", default="", help="폴더 추론 결과 CSV 경로")
     parser.add_argument("--top-k", type=int, default=5, help="단일/폴더 Top-K 계산 수")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--dropout-p", type=float, default=0.2)
-    parser.add_argument(
-        "--transform-profile",
-        choices=["team", "square", "legacy"],
-        default="team",
-        help="team: 2:1 resize + ImageNet norm / square: 1:1 + ImageNet norm / legacy: custom norm",
-    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Config] device={device} | transform={args.transform_profile}")
-
+    print(f"[Config] device={device}")
     model, index_to_label = load_model_and_labels(args.model, args.label_map, args.dropout_p, device)
-    transform = build_transform(args.image_size, args.transform_profile)
+    transform = build_transform(args.image_size)
 
     if args.image:
         print(f"\n[이미지] {args.image}")
