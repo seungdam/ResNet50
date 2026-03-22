@@ -1,0 +1,37 @@
+                       precision    recall  f1-score   support
+
+    athleisure_female     0.1765    0.3000    0.2222       130
+ bodyconscious_female     0.1481    0.3366    0.2057       202
+            bold_male     0.2578    0.4743    0.3340       525
+      cityglam_female     0.1923    0.1172    0.1456       384
+       classic_female     0.1763    0.1368    0.1541       402
+         disco_female     0.1290    0.0909    0.1067       220
+       ecology_female     0.1311    0.2520    0.1725       254
+      feminine_female     0.3690    0.0900    0.1447       689
+    genderless_female     0.1238    0.2521    0.1660       353
+        grunge_female     0.0949    0.0867    0.0906       150
+        hiphop_female     0.1094    0.3152    0.1625       184
+          hiphop_male     0.2857    0.3846    0.3279       442
+        hippie_female     0.2797    0.2568    0.2678       440
+          hippie_male     0.2327    0.1395    0.1744       337
+             ivy_male     0.3471    0.2121    0.2633       396
+        kitsch_female     0.2048    0.1325    0.1609       385
+      lingerie_female     0.1499    0.3678    0.2130       174
+        lounge_female     0.1900    0.2272    0.2069       383
+     metrosexual_male     0.2287    0.1372    0.1715       430
+      military_female     0.0820    0.3190    0.1305       116
+       minimal_female     0.2966    0.3223    0.3089       543
+            mods_male     0.4094    0.4349    0.4218       499
+      normcore_female     0.3469    0.0493    0.0864      1034
+        normcore_male     0.4978    0.2292    0.3139      1479
+      oriental_female     0.2397    0.1963    0.2159       326
+        popart_female     0.1672    0.2835    0.2103       194
+     powersuit_female     0.3728    0.4262    0.3977       732
+          punk_female     0.2080    0.1588    0.1801       296
+         space_female     0.1239    0.2938    0.1743       194
+sportivecasual_female     0.2554    0.2772    0.2659       635
+  sportivecasual_male     0.3718    0.4167    0.3930       804
+
+             accuracy                         0.2477     13332
+            macro avg     0.2322    0.2489    0.2190     13332
+         weighted avg     0.2901    0.2477    0.2424     13332
