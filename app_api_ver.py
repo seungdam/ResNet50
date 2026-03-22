@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -76,12 +77,24 @@ class StreamlitApiRecommendationApp:
 
     def _render_sidebar(self) -> Dict[str, object]:
         st = self.st
+        default_api_base = self._resolve_default("API_BASE_URL", "http://127.0.0.1:8000")
+        default_search_path = self._resolve_default("SEARCH_PATH", "/search")
+        default_timeout = self._resolve_default_int("REQUEST_TIMEOUT_SEC", 60)
+        default_verify_ssl = self._resolve_default_bool("VERIFY_SSL", True)
+        default_token = self._resolve_default("API_BEARER_TOKEN", "")
+
         with st.sidebar:
             st.subheader("API Settings")
-            api_base = st.text_input("API Base URL", value="http://127.0.0.1:8000")
-            search_path = st.text_input("Search Path", value="/search")
-            timeout_sec = st.number_input("Request timeout (sec)", min_value=5, max_value=600, value=60, step=5)
-            verify_ssl = st.checkbox("Verify SSL", value=True)
+            api_base = st.text_input("API Base URL", value=default_api_base)
+            search_path = st.text_input("Search Path", value=default_search_path)
+            timeout_sec = st.number_input(
+                "Request timeout (sec)",
+                min_value=5,
+                max_value=600,
+                value=max(5, min(600, int(default_timeout))),
+                step=5,
+            )
+            verify_ssl = st.checkbox("Verify SSL", value=default_verify_ssl)
             preview_mode = st.checkbox("Preview mode (no API call)", value=False)
 
             st.divider()
@@ -93,8 +106,12 @@ class StreamlitApiRecommendationApp:
             )
 
             st.divider()
-            st.subheader("Optional Header")
-            auth_token = st.text_input("Bearer token (optional)", value="", type="password")
+            st.subheader("Auth")
+            if default_token:
+                st.caption("Bearer token is loaded from secrets/env. (hidden)")
+            else:
+                st.caption("No bearer token configured in secrets/env.")
+            auth_token = default_token
 
         return {
             "api_base": str(api_base).strip(),
@@ -106,6 +123,32 @@ class StreamlitApiRecommendationApp:
             "style_csv": str(style_csv),
             "auth_token": str(auth_token).strip(),
         }
+
+    def _resolve_default(self, key: str, fallback: str) -> str:
+        st = self.st
+        try:
+            value = st.secrets.get(key, None)  # type: ignore[attr-defined]
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        except Exception:
+            pass
+        env_val = os.getenv(key, "").strip()
+        return env_val if env_val else fallback
+
+    def _resolve_default_int(self, key: str, fallback: int) -> int:
+        raw = self._resolve_default(key, str(fallback))
+        try:
+            return int(raw)
+        except Exception:
+            return int(fallback)
+
+    def _resolve_default_bool(self, key: str, fallback: bool) -> bool:
+        raw = self._resolve_default(key, "true" if fallback else "false").strip().lower()
+        if raw in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        return bool(fallback)
 
     def _resolve_style_options(self, settings: Dict[str, object]) -> List[str]:
         manual = parse_csv_list(str(settings["style_csv"]))
@@ -176,7 +219,6 @@ class StreamlitApiRecommendationApp:
 
         st.subheader("User Input")
         uploaded = st.file_uploader("Upload user image", type=["jpg", "jpeg", "png"])
-
         col1, col2, col3 = st.columns(3)
         with col1:
             gender_filter = st.selectbox("Gender", ["all", "male", "female"], index=0)
