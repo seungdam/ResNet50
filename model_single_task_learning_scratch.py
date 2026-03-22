@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import os
 import random
@@ -33,6 +33,40 @@ from torchvision import transforms
 # 4) 추천 시스템을 위한 feature extraction 경로를 유지합니다.
 # -----------------------------------------------------------------------------
 
+def calculate_mean_std(image_paths: List[str], image_size: int) -> Tuple[List[float], List[float]]:
+    """
+    train 이미지 폴더에서 채널별 mean/std를 계산합니다.
+    정규화 없이 [0, 1] 범위 픽셀값에 대해 계산합니다.
+    """
+    # 정규화 없이 텐서만 변환
+    raw_transform = transforms.Compose([
+        transforms.Resize((2 * image_size, image_size)),
+        transforms.ToTensor(),  # [0, 1] 범위로만 변환, Normalize 없음
+    ])
+
+    paths = [Path(p) for p in image_paths]
+
+    # 채널별 누적값
+    channel_sum    = torch.zeros(3)
+    channel_sq_sum = torch.zeros(3)
+    pixel_count = 0
+
+    for path in paths:
+        try:
+            img = Image.open(path).convert("RGB")
+            tensor = raw_transform(img)  # shape: [3, H, W]
+        except Exception:
+            continue
+
+        channel_sum    += tensor.sum(dim=[1, 2])       # 채널별 픽셀 합
+        channel_sq_sum += (tensor ** 2).sum(dim=[1, 2]) # 채널별 픽셀 제곱 합
+        pixel_count    += tensor.shape[1] * tensor.shape[2]
+
+    mean = channel_sum / pixel_count
+    # Var(X) = E[X²] - E[X]²
+    std  = (channel_sq_sum / pixel_count - mean ** 2).sqrt()
+
+    return mean.tolist(), std.tolist()
 
 def seed_everything(seed: int = 42) -> None:
     """재현 가능한 실험을 위해 랜덤 시드를 고정합니다."""
@@ -45,7 +79,6 @@ def seed_everything(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 def parse_image_metadata(file_name: str) -> Optional[Dict[str, str]]:
     """
@@ -79,7 +112,6 @@ def parse_image_metadata(file_name: str) -> Optional[Dict[str, str]]:
         "gender_token": gender_token,
         "gender": gender,
     }
-
 
 def collect_records(image_dir: str) -> Tuple[List[Dict[str, str]], List[str]]:
     """
@@ -117,7 +149,6 @@ def collect_records(image_dir: str) -> Tuple[List[Dict[str, str]], List[str]]:
 
     return records, invalid_files
 
-
 def print_label_inventory(records: List[Dict[str, str]], title: str) -> None:
     """결합 라벨별 이미지 개수를 출력합니다."""
     label_counter = Counter(rec["label"] for rec in records)
@@ -129,7 +160,6 @@ def print_label_inventory(records: List[Dict[str, str]], title: str) -> None:
         return
     for idx, label in enumerate(sorted(label_counter.keys()), start=1):
         print(f"  {idx:>2}. {label}: {label_counter[label]}")
-
 
 def save_label_distribution(records: List[Dict[str, str]], csv_path: Path) -> None:
     """라벨 분포를 CSV로 저장합니다."""
@@ -147,7 +177,6 @@ def save_label_distribution(records: List[Dict[str, str]], csv_path: Path) -> No
         .sort_values(["gender", "style"])
     )
     dist_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
 
 def split_train_val_records(
     records: List[Dict[str, str]], val_ratio: float, seed: int
@@ -198,7 +227,6 @@ def split_train_val_records(
     rng.shuffle(val_records)
     return train_records, val_records
 
-
 def split_train_val_records_stratified(
     records: List[Dict[str, str]], val_ratio: float, seed: int
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
@@ -220,7 +248,6 @@ def split_train_val_records_stratified(
         stratify=stratify_keys if can_stratify else None,
     )
     return train_records, val_records
-
 
 class FashionStyleDataset(Dataset):
     """이미지 텐서와 결합 라벨 인덱스를 반환하는 Dataset."""
@@ -247,14 +274,11 @@ class FashionStyleDataset(Dataset):
             image = Image.open(item["path"]).convert("RGB")
         except Exception as e:
             print(f"[WARN] 이미지 로드 실패, fallback 이미지를 사용합니다: {item['path']} | {e}")
-            # fallback 이미지는 3:4 세로 비율을 유지합니다.
-            target_h = int(round(self.image_size * (4 / 3)))
-            image = Image.new("RGB", (self.image_size, target_h), color=0)
+            image = Image.new("RGB", (self.image_size, 2 * self.image_size), color=0)
         if self.transform is not None:
             image = self.transform(image)
         label_idx = self.label_to_index[item["label"]]
         return image, label_idx
-
 
 class Bottleneck(nn.Module):
     # ResNet50 bottleneck block: 1x1 -> 3x3 -> 1x1, expansion=4
@@ -297,7 +321,6 @@ class Bottleneck(nn.Module):
         out += identity
         out = self.relu(out)
         return out
-
 
 class ResNet(nn.Module):
     """
@@ -427,51 +450,21 @@ class ResNet(nn.Module):
             return logits, feature_vector
         return logits
 
-
 def resnet50(img_channels: int, num_classes: int, dropout_p: float = 0.0) -> ResNet:
     """ResNet50 생성 헬퍼 함수."""
     return ResNet(img_channels, 50, Bottleneck, num_classes, dropout_p=dropout_p)
 
-
-def create_transforms(
-    image_size: int,
-    profile: str = "legacy",
-) -> Tuple[transforms.Compose, transforms.Compose]:
+def create_transforms(  image_size: int,
+                        mean_arg: List[float],
+                        std_arg: List[float]
+                      ) -> Tuple[transforms.Compose, transforms.Compose]:
     """
-    train/validation 변환을 생성합니다.
-    - train: augmentation + normalize
-    - val: resize + normalize
-
-    legacy 프로필은 3000x4000 세로형 이미지 비율 특성을 반영합니다.
-    team 프로필은 ImageNet 호환 정규화를 사용합니다.
+    scratch 학습용 train/validation 변환을 생성합니다.
+    - 팀 코드와 동일하게 resize는 (2 * image_size, image_size) 형태를 사용
+    - 정규화는 요청사항에 맞춰 scratch 전용 mean/std를 유지
     """
-    # legacy 모드는 세로(H)가 더 긴 형태를 유지합니다.
-    if profile == "team":
-        train_transform = transforms.Compose([
-            transforms.Resize((2 * image_size, image_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ])
-
-        val_transform = transforms.Compose([
-            transforms.Resize((2 * image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ])
-        return train_transform, val_transform
-
-    if profile != "legacy":
-        raise ValueError(f"알 수 없는 transform profile: {profile}. ['legacy', 'team'] 중 하나를 사용하세요.")
-
-    target_h = int(round(image_size * (4 / 3)))  # 299
-    target_w = image_size                          # 224
+    target_h = image_size * 2
+    target_w = image_size
 
     train_transform = transforms.Compose([
         transforms.Resize((target_h, target_w)),
@@ -479,8 +472,8 @@ def create_transforms(
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(
-            mean=[0.5498, 0.5226, 0.5052],
-            std=[0.2600, 0.2582, 0.2620],
+            mean=mean_arg,
+            std=std_arg,
         ),
     ])
 
@@ -488,13 +481,12 @@ def create_transforms(
         transforms.Resize((target_h, target_w)),
         transforms.ToTensor(),
         transforms.Normalize(
-            mean=[0.5498, 0.5226, 0.5052],
-            std=[0.2600, 0.2582, 0.2620],
+             mean=mean_arg,
+            std=std_arg,
         ),
     ])
 
     return train_transform, val_transform
-
 
 def build_class_weights(
     train_records: List[Dict[str, str]],
@@ -511,7 +503,6 @@ def build_class_weights(
 
     weights = class_counts.sum() / (len(class_counts) * np.clip(class_counts, 1.0, None))
     return torch.tensor(weights, dtype=torch.float32, device=device)
-
 
 def evaluate(
     model: nn.Module,
@@ -567,7 +558,6 @@ def evaluate(
     accuracy = (correct / total) * 100 if total > 0 else 0.0
     return avg_loss, accuracy, all_labels, all_preds
 
-
 def validate_label_coverage(train_records: List[Dict[str, str]]) -> Tuple[int, int, int]:
     """결합 라벨 single-head 학습을 위한 최소 라벨 커버리지를 검증합니다."""
     style_count = len({r["style"] for r in train_records})
@@ -581,7 +571,6 @@ def validate_label_coverage(train_records: List[Dict[str, str]]) -> Tuple[int, i
         raise ValueError("학습 데이터에 결합 라벨이 최소 2개 이상 필요합니다.")
     return style_count, gender_count, label_count
 
-
 def run_single_training(
     args: argparse.Namespace,
     output_dir: Path,
@@ -590,50 +579,49 @@ def run_single_training(
     if not 0.0 <= args.dropout_p < 1.0:
         raise ValueError("--dropout-p must be in [0.0, 1.0).")
 
-    if args.compare_with_team:
-        # 팀 설정과 공정 비교를 위한 원스위치 프리셋
-        args.split_mode = "stratified"
-        args.transform_profile = "team"
-        print(
-            "[Preset] compare-with-team 활성화: split=stratified, transform=team "
-            "(필요하면 batch/lr/dropout을 팀 설정으로 맞추세요)"
-        )
-
     # STEP 0) 재현성 및 출력 경로 준비
     seed_everything(args.seed)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # STEP 1) 파일/라벨 파싱
-    all_records, train_invalid = collect_records(args.train_dir)
-    print_label_inventory(all_records, "원본 train_dir 라벨 분포 (분할 전)")
-
-    # 선택한 split 모드와 val_ratio로 분할
-    if args.split_mode == "manual":
-        train_records, val_records = split_train_val_records(
-            all_records, val_ratio=args.val_ratio, seed=args.seed
-        )
-    elif args.split_mode == "stratified":
-        train_records, val_records = split_train_val_records_stratified(
-            all_records, val_ratio=args.val_ratio, seed=args.seed
-        )
+    # STEP 1) 파일/라벨 파싱 (team 코드와 동일하게 train/val/test 경로를 각각 사용)
+    train_records, train_invalid = collect_records(args.train_dir)
+    if args.val_dir:
+        val_records, val_invalid = collect_records(args.val_dir)
     else:
-        raise ValueError(f"알 수 없는 split mode: {args.split_mode}")
-    val_invalid: List[str] = []  # val은 train 분할로 생성되므로 별도 invalid 스캔 없음
-    print_label_inventory(train_records, f"Train 분할 ({1 - args.val_ratio:.0%}/{args.val_ratio:.0%})")
-    print_label_inventory(val_records,   f"Val 분할   ({1 - args.val_ratio:.0%}/{args.val_ratio:.0%})")
+        val_records  = []
+        val_invalid  = []
 
-    # 선택적 test_dir 처리 (--test-dir)
     if args.test_dir:
         test_records, test_invalid = collect_records(args.test_dir)
-        print_label_inventory(test_records, "Test 라벨 분포")
     else:
         test_records = []
         test_invalid = []
+
+    print_label_inventory(train_records, "Train 라벨 분포")
+    if not args.val_dir:
+        print(f"[Step 1] val-dir 미지정 → train 에서 {args.val_ratio*100:.0f}% 자동 분할")
+        train_records, val_records = split_train_val_records(
+            train_records, args.val_ratio, args.seed
+        )
+        val_invalid = []
+
+    print_label_inventory(val_records,   "Validation 라벨 분포")
+    print_label_inventory(test_records,  "Test 라벨 분포")
 
     if len(train_records) == 0 or len(val_records) == 0:
         raise ValueError("Train/validation 레코드가 비어 있습니다. 경로와 파일명 형식을 확인하세요.")
     if args.test_dir and len(test_records) == 0:
         raise ValueError("Test 레코드가 비어 있습니다. test 경로와 파일명 형식을 확인하세요.")
+
+    norm_cache = Path(args.output_dir) / "norm_cache.json"
+    if norm_cache.exists():
+        cache = json.loads(norm_cache.read_text())
+        mean, std = cache["mean"], cache["std"]
+        print(f"[Step 1-2] cached mean={mean}, std={std}")
+    else:
+        train_image_paths = [r["path"] for r in train_records]
+        mean, std = calculate_mean_std(train_image_paths, args.image_size)
+        print(f"[Step 1-2] train mean={[f'{v:.4f}' for v in mean]}, std={[f'{v:.4f}' for v in std]}")
 
     # STEP 2) 라벨 커버리지 검증
     actual_style_count, actual_gender_count, actual_label_count = validate_label_coverage(train_records)
@@ -663,14 +651,11 @@ def run_single_training(
     filtered_test_records = [r for r in test_records if r["label"] in label_to_index]
     dropped_test = len(test_records) - len(filtered_test_records)
     test_records = filtered_test_records
-    if args.test_dir and len(test_records) == 0:
+    if len(test_records) == 0:
         raise ValueError("라벨 필터링 후 Test 레코드가 비었습니다.")
 
     # STEP 5) Dataset / DataLoader 생성
-    train_transform, val_transform = create_transforms(
-        args.image_size,
-        profile=args.transform_profile,
-    )
+    train_transform, val_transform = create_transforms(args.image_size, mean, std)
     train_dataset = FashionStyleDataset(train_records, label_to_index, train_transform, args.image_size)
     val_dataset   = FashionStyleDataset(val_records,   label_to_index, val_transform,   args.image_size)
     test_dataset  = (
@@ -748,15 +733,10 @@ def run_single_training(
         f"train 샘플={len(train_dataset)}, val 샘플={len(val_dataset)}, "
         f"train 배치={len(train_loader)}, val 배치={len(val_loader)}, "
         f"batch_size={args.batch_size}, num_workers={args.num_workers}, "
-        f"val_ratio={args.val_ratio}, split_mode={args.split_mode}, "
-        f"transform_profile={args.transform_profile}, init_mode=scratch, "
-        f"dropout_p={args.dropout_p}, lr={args.lr}, "
+        f"init_mode=scratch, dropout_p={args.dropout_p}, lr={args.lr}, "
         f"use_class_weights={apply_class_weights}"
     )
-    if test_loader is not None:
-        print(f"test 샘플={len(test_dataset)}, test 배치={len(test_loader)} (최종 평가)")
-    else:
-        print("[INFO] --test-dir 미입력: 최종 지표는 validation split 기준으로 계산합니다.")
+    print(f"test 샘플={len(test_dataset)}, test 배치={len(test_loader)} (최종 평가)")
     if len(train_dataset) > 0:
         print(f"예시 train 파일={train_dataset.samples[0]['path']}")
 
@@ -943,20 +923,20 @@ def run_single_training(
         "actual_label_count": actual_label_count,
         "model_family": "resnet50_custom",
         "init_mode": "scratch",
-        "split_mode": args.split_mode,
-        "transform_profile": args.transform_profile,
-        "compare_with_team": args.compare_with_team,
-        "val_ratio": args.val_ratio,
+        "data_split_mode": "external_train_val_test_paths",
         "image_size": args.image_size,
         "batch_size": args.batch_size,
         "dropout_p": args.dropout_p,
         "lr": args.lr,
         "use_class_weights": apply_class_weights,
         "invalid_train_filenames": len(train_invalid),
-        "invalid_val_filenames": 0,  # val은 train_dir 분할로 생성
-        "invalid_test_filenames": len(test_invalid) if args.test_dir else None,
+        "invalid_val_filenames": len(val_invalid),
+        "invalid_test_filenames": len(test_invalid),
         "dropped_val_labels_not_in_train": dropped_val,
         "dropped_test_labels_not_in_train": dropped_test,
+        "resize": f"({2 * args.image_size}, {args.image_size})",
+        "norm_mean": mean,
+        "norm_std" : std
     }
     with open(output_dir / "run_summary.json", "w", encoding="utf-8") as f:
         json.dump(run_summary, f, ensure_ascii=False, indent=2)
@@ -974,7 +954,6 @@ def run_single_training(
 
     return run_summary
 
-
 def run_training(args: argparse.Namespace) -> None:
     """single-head 학습 진입점 함수."""
     base_output_dir = Path(args.output_dir)
@@ -984,94 +963,68 @@ def run_training(args: argparse.Namespace) -> None:
     with open(base_output_dir / "single_run_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-
 def build_arg_parser() -> argparse.ArgumentParser:
     """명령행 인자를 정의합니다."""
     parser = argparse.ArgumentParser(
         description="ResNet50 패션 스타일 학습 (single-head, scratch 고정)"
     )
-    parser.add_argument("--train-dir", type=str, required=True, help="학습 이미지 경로")
-    parser.add_argument("--test-dir", type=str, default="", help="테스트 이미지 경로 (선택)")
-    parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.3,
-        help="Validation 분할 비율 (기본 0.3 -> 70/30 분할)",
-    )
-    parser.add_argument(
-        "--split-mode",
-        type=str,
-        choices=["manual", "stratified"],
-        default="manual",
-        help="Train/Val 분할 방식: manual(라벨별) 또는 sklearn stratified",
-    )
-    parser.add_argument(
-        "--transform-profile",
-        type=str,
-        choices=["legacy", "team"],
-        default="legacy",
-        help="Transform 프로필: legacy 또는 team",
-    )
-    parser.add_argument(
-        "--compare-with-team",
-        action="store_true",
-        help="공정 비교 프리셋: stratified split + team transform",
-    )
-    parser.add_argument(
-        "--image-size",
-        type=int,
-        default=224,
-        help="입력 이미지 가로 크기 (legacy는 세로 비율을 유지)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="배치 크기 (OOM 발생 시 16/8로 축소)",
-    )
-    parser.add_argument("--num-epochs", type=int, default=50, help="최대 학습 epoch 수")
-    parser.add_argument("--patience", type=int, default=7, help="Early stopping patience")
-    parser.add_argument("--lr", type=float, default=3e-4, help="AdamW 학습률")
-    parser.add_argument(
-        "--dropout-p",
-        type=float,
-        default=0.5,
-        help="분류기 head 직전 Dropout 비율",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="DataLoader worker 수 (Windows는 0부터 시작 권장)",
-    )
-    parser.add_argument(
-        "--log-interval",
-        type=int,
-        default=20,
-        help="배치 로그 출력 간격 (0이면 비활성화)",
-    )
-    parser.add_argument(
-        "--data-wait-warn-sec",
-        type=float,
-        default=10.0,
-        help="data loading 대기시간 경고 임계값(초)",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="랜덤 시드")
-    parser.add_argument("--output-dir", type=str, default="outputs_resnet50", help="출력 디렉터리")
-    parser.add_argument(
-        "--disable-class-weights",
-        action="store_true",
-        help="CrossEntropyLoss의 class weights 비활성화",
-    )
-    return parser
+    parser.add_argument("--train-dir", type=str,
+                        required=True, 
+                        help="Train 이미지 경로.")
+    parser.add_argument("--val-dir", type=str, 
+                        default="",
+                        help="Validation 이미지 경로. 비워두면 --val-ratio 기준으로 train에서 자동 분할.")
+    parser.add_argument("--test-dir", type=str, 
+                        default="",
+                        help="Test 이미지 경로. 제공 시 Best 모델로 최종 test 평가 수행")
+    parser.add_argument("--image-size", type=int,  
+                        default=224,
+                        help="입력 이미지 가로 크기",)
+    parser.add_argument("--val-ratio", type=float, 
+                        default=0.3,
+                        help="val-dir 미지정 시 train 에서 자동 분할할 비율 (기본 0.3 = 30%%)")
 
+    parser.add_argument("--batch-size", type=int, 
+                        default=32,
+                        help="배치 크기 (OOM 발생 시 32/16으로 축소)")
+    parser.add_argument("--num-epochs", type=int,
+                        default=30,
+                        help="최대 학습 epoch 수")
+    parser.add_argument("--patience", type=int, 
+                        default=5, 
+                        help="Early Stopping count thresh hold")
+    
+    parser.add_argument("--lr", type=float, 
+                        default=1e-4, 
+                        help="AdamW 학습률")
+    
+    parser.add_argument("--dropout-p", type=float,
+                        default=0.2,
+                        help="분류기 head 직전 Dropout 비율")
+    
+    parser.add_argument("--num-workers", type=int,
+                        default=4,
+                        help="DataLoader worker 수")
+    
+    parser.add_argument("--log-interval", type=int,
+                        default=20,
+                        help="배치 로그 출력 간격 (0이면 비활성화)")
+    parser.add_argument("--data-wait-warn-sec", type=float,
+                        default=10.0,
+                        help="data loading 대기시간 경고 임계값(초)"
+                        )
+    parser.add_argument("--seed", type=int, default=42, help="Random Seed")
+    parser.add_argument("--output-dir", type=str, default="outputs_resnet50", help="출력 디렉터리")
+    parser.add_argument("--disable-class-weights",
+                        action="store_true",
+                        help="CrossEntropyLoss의 class weights 비활성화")
+    return parser
 
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
     args.use_class_weights = not args.disable_class_weights
     run_training(args)
-
 
 if __name__ == "__main__":
     main()

@@ -32,6 +32,42 @@ from torchvision import transforms
 # 4) 추천 시스템에서 재사용할 수 있는 feature vector(임베딩) 추출 지원
 # -----------------------------------------------------------------------------
 
+
+def calculate_mean_std(image_paths: List[str], image_size: int) -> Tuple[List[float], List[float]]:
+    """
+    train 이미지 폴더에서 채널별 mean/std를 계산합니다.
+    정규화 없이 [0, 1] 범위 픽셀값에 대해 계산합니다.
+    """
+    # 정규화 없이 텐서만 변환
+    raw_transform = transforms.Compose([
+        transforms.Resize((2 * image_size, image_size)),
+        transforms.ToTensor(),  # [0, 1] 범위로만 변환, Normalize 없음
+    ])
+
+    paths = [Path(p) for p in image_paths]
+
+    # 채널별 누적값
+    channel_sum    = torch.zeros(3)
+    channel_sq_sum = torch.zeros(3)
+    pixel_count = 0
+
+    for path in paths:
+        try:
+            img = Image.open(path).convert("RGB")
+            tensor = raw_transform(img)  # shape: [3, H, W]
+        except Exception:
+            continue
+
+        channel_sum    += tensor.sum(dim=[1, 2])       # 채널별 픽셀 합
+        channel_sq_sum += (tensor ** 2).sum(dim=[1, 2]) # 채널별 픽셀 제곱 합
+        pixel_count    += tensor.shape[1] * tensor.shape[2]
+
+    mean = channel_sum / pixel_count
+    # Var(X) = E[X²] - E[X]²
+    std  = (channel_sq_sum / pixel_count - mean ** 2).sqrt()
+
+    return mean.tolist(), std.tolist()
+
 def seed_everything(seed: int = 42) -> None:
     """
     실험 재현성을 높이기 위한 시드 고정 함수.
@@ -46,7 +82,6 @@ def seed_everything(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 def parse_image_metadata(file_name: str) -> Optional[Dict[str, str]]:
     """
@@ -80,7 +115,6 @@ def parse_image_metadata(file_name: str) -> Optional[Dict[str, str]]:
         "gender_token": gender_token,
         "gender": gender,
     }
-
 
 def collect_records(image_dir: str) -> Tuple[List[Dict[str, str]], List[str]]:
     """
@@ -118,7 +152,6 @@ def collect_records(image_dir: str) -> Tuple[List[Dict[str, str]], List[str]]:
 
     return records, invalid_files
 
-
 def print_label_inventory(records: List[Dict[str, str]], title: str) -> None:
     """
     결합 라벨(label=style_gender) 목록과 각 라벨별 이미지 개수를 출력합니다.
@@ -133,7 +166,6 @@ def print_label_inventory(records: List[Dict[str, str]], title: str) -> None:
         return
     for idx, label in enumerate(sorted(label_counter.keys()), start=1):
         print(f"  {idx:>2}. {label}: {label_counter[label]}")
-
 
 def save_label_distribution(records: List[Dict[str, str]], csv_path: Path) -> None:
     """
@@ -154,7 +186,6 @@ def save_label_distribution(records: List[Dict[str, str]], csv_path: Path) -> No
         .sort_values(["gender", "style"])
     )
     dist_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
 
 def split_train_val_records(
     records: List[Dict[str, str]], val_ratio: float, seed: int
@@ -205,7 +236,6 @@ def split_train_val_records(
     rng.shuffle(val_records)
     return train_records, val_records
 
-
 class FashionStyleDataset(Dataset):
     """
     PyTorch Dataset.
@@ -240,74 +270,17 @@ class FashionStyleDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, int, int, int]:
         item = self.samples[idx]
-        # PIL로 이미지를 열고 RGB 3채널로 통일
         try:
             image = Image.open(item["path"]).convert("RGB")
         except Exception as e:
             print(f"[WARN] 이미지 로드 실패, 검은 이미지 대체: {item['path']} | {e}")
-            image = Image.new("RGB", (self.image_size, self.image_size), color=0)
+            image = Image.new("RGB", (self.image_size, 2 * self.image_size), color=0)
         if self.transform is not None:
-            # augmentation / resize / normalize 적용
             image = self.transform(image)
         style_idx = self.style_to_index[item["style"]]
         gender_idx = self.gender_to_index[item["gender"]]
         label_idx = self.label_to_index[item["label"]]
         return image, style_idx, gender_idx, label_idx
-
-
-class BasicBlock(nn.Module):
-    """
-    ResNet18 계열에서 주로 사용하는 기본 residual block.
-    현재 기본 학습 모델은 ResNet50이라 Bottleneck을 사용하지만,
-    코드 확장성을 위해 BasicBlock도 유지합니다.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int = 1,
-        expansion: int = 1,
-        downsample: nn.Module = None,
-    ) -> None:
-        super(BasicBlock, self).__init__()
-        self.expansion = expansion
-        self.downsample = downsample
-        self.conv1 = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            bias=False,
-        )
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(
-            out_channels,
-            out_channels * self.expansion,
-            kernel_size=3,
-            padding=1,
-            bias=False,
-        )
-        self.bn2 = nn.BatchNorm2d(out_channels * self.expansion)
-
-    def forward(self, x: Tensor) -> Tensor:
-        identity = x
-        # 주 경로(main path)
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        if self.downsample is not None:
-            # skip 경로 크기(채널/해상도) 맞춤
-            identity = self.downsample(x)
-        # residual 연결: out + identity
-        out += identity
-        out = self.relu(out)
-        return out
-
 
 class Bottleneck(nn.Module):
     # ResNet50의 핵심 블록: 1x1 -> 3x3 -> 1x1, 마지막에 채널 4배 확장
@@ -354,7 +327,6 @@ class Bottleneck(nn.Module):
         out = self.relu(out)
         return out
 
-
 class ResNet(nn.Module):
     """
     ResNet 본체.
@@ -374,16 +346,11 @@ class ResNet(nn.Module):
         super(ResNet, self).__init__()
         if not 0.0 <= dropout_p < 1.0:
             raise ValueError("dropout_p must be in [0.0, 1.0).")
-        if num_layers == 18:
-            # ResNet18 stage 반복 수: [2, 2, 2, 2]
-            layers = [2, 2, 2, 2]
-            self.expansion = 1
-        elif num_layers == 50:
-            # ResNet50 stage 반복 수: [3, 4, 6, 3]
+        if num_layers == 50:
             layers = [3, 4, 6, 3]
             self.expansion = 4
         else:
-            raise ValueError("num_layers must be one of [18, 50].")
+            raise ValueError("num_layers must be 50.")
 
         self.in_channels = 64
         # 7x7, stride=2: 고해상도 입력에서 초반 연산량을 줄이는 기본 stem
@@ -494,7 +461,6 @@ class ResNet(nn.Module):
             return style_logits, gender_logits, feature_vector
         return style_logits, gender_logits
 
-
 def resnet50(
     img_channels: int,
     num_style_classes: int,
@@ -513,51 +479,42 @@ def resnet50(
         dropout_p=dropout_p,
     )
 
-def resnet18(
-    img_channels: int,
-    num_style_classes: int,
-    num_gender_classes: int,
-    dropout_p: float = 0.0,
-) -> ResNet:
-    return ResNet(
-        img_channels,
-        18,
-        BasicBlock,
-        num_style_classes=num_style_classes,
-        num_gender_classes=num_gender_classes,
-        dropout_p=dropout_p,
-    )
-
-def create_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Compose]:
+def create_transforms(image_size: int,
+                      mean_arg: List[float],
+                    std_arg: List[float]
+                      ) -> Tuple[transforms.Compose, transforms.Compose]:
     """
     학습/검증 전처리 파이프라인 구성.
     - train: augmentation 포함
     - val: resize + normalize 중심
-    입력 원본이 3000x4000(3:4)에 가깝다는 가정으로 비율 유지 resize를 적용합니다.
+
+    팀 전처리 기준: 이미지를 사전에 W=224, H=448 (2:1 세로형)으로 리사이즈해 저장.
+    → target_h = 2 * image_size, target_w = image_size
+    → RandomResizedCrop 불필요 (이미 크롭된 고정 크기 이미지)
     """
-    target_h = image_size
-    target_w = int(round(image_size * (4 / 3)))
+    target_h = 2 * image_size  # 448
+    target_w = image_size       # 224
 
     train_transform = transforms.Compose([
-    transforms.Resize((target_h, target_w)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.5498, 0.5226, 0.5052],
-        std=[0.2600, 0.2582, 0.2620],
-    ),
+        transforms.Resize((target_h, target_w)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=mean_arg,
+            std=std_arg,
+        ),
     ])
 
     val_transform = transforms.Compose([
-    transforms.Resize((target_h, target_w)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.5498, 0.5226, 0.5052],
-        std=[0.2600, 0.2582, 0.2620],
-    ),
+        transforms.Resize((target_h, target_w)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+             mean=mean_arg,
+            std=std_arg,
+        ),
     ])
-    
-    
+
     return train_transform, val_transform
 
 def build_class_weights(
@@ -577,7 +534,6 @@ def build_class_weights(
     # 샘플 수가 적은 클래스의 손실을 조금 더 크게 주기 위한 역빈도 가중치
     weights = class_counts.sum() / (len(class_counts) * np.clip(class_counts, 1.0, None))
     return torch.tensor(weights, dtype=torch.float32, device=device)
-
 
 def evaluate(
     model: nn.Module,
@@ -690,7 +646,6 @@ def evaluate(
         "combined_preds": all_combined_preds,
     }
 
-
 def validate_label_coverage(train_records: List[Dict[str, str]]) -> Tuple[int, int, int]:
     """
     멀티태스크(style/gender) + 결합 라벨 지표 계산을 위한 기본 라벨 커버리지 검증.
@@ -705,7 +660,6 @@ def validate_label_coverage(train_records: List[Dict[str, str]]) -> Tuple[int, i
     if label_count < 2:
         raise ValueError("결합 클래스(label) 개수가 2개 미만입니다. 파일명 라벨을 확인하세요.")
     return style_count, gender_count, label_count
-
 
 def run_single_training(
     args: argparse.Namespace,
@@ -723,45 +677,49 @@ def run_single_training(
     seed_everything(args.seed)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # STEP 1) 파일 스캔 및 라벨 파싱
+    # STEP 1) 파일/라벨 파싱 — val-dir / test-dir 가 없으면 자동 분할
     train_records, train_invalid = collect_records(args.train_dir)
-    print_label_inventory(
-        train_records,
-        "Raw train_dir label inventory (before 7:3 split)",
-    )
 
-    # 요구사항: train_dir 전체를 label 기준 7:3으로 train/valid 자동 분할
-    train_records, val_records = split_train_val_records(
-        train_records, val_ratio=0.3, seed=args.seed
-    )
-    print_label_inventory(
-        train_records,
-        "Train split label inventory (after 7:3 split)",
-    )
-    print_label_inventory(
-        val_records,
-        "Validation split label inventory (after 7:3 split)",
-    )
-    val_invalid: List[str] = []
-
-    # 요구사항: val_dir는 test 셋 경로로 사용
     if args.val_dir:
-        test_records, test_invalid = collect_records(args.val_dir)
-        print_label_inventory(
-            test_records,
-            "Test label inventory (loaded from --val-dir)",
-        )
+        val_records, val_invalid = collect_records(args.val_dir)
+    else:
+        val_records = []
+        val_invalid = []
+
+    if args.test_dir:
+        test_records, test_invalid = collect_records(args.test_dir)
     else:
         test_records = []
         test_invalid = []
 
-    if len(train_records) == 0 or len(val_records) == 0:
-        raise ValueError(
-            "Train/validation records are empty. "
-            "Check directory and filename format."
+    print_label_inventory(train_records, "Train 라벨 분포")
+
+    # val-dir 미제공 시 train에서 stratified 자동 분할
+    if not args.val_dir:
+        print(f"[Step 1] val-dir 미지정 → train에서 {args.val_ratio*100:.0f}% 자동 분할")
+        train_records, val_records = split_train_val_records(
+            train_records, val_ratio=args.val_ratio, seed=args.seed
         )
-    if args.val_dir and len(test_records) == 0:
-        raise ValueError("Test records are empty. Check test directory and filename format.")
+        val_invalid = []
+
+    print_label_inventory(val_records,  "Validation 라벨 분포")
+    print_label_inventory(test_records, "Test 라벨 분포")
+
+    if len(train_records) == 0 or len(val_records) == 0:
+        raise ValueError("Train/validation 레코드가 비어 있습니다. 경로와 파일명 형식을 확인하세요.")
+    if args.test_dir and len(test_records) == 0:
+        raise ValueError("Test 레코드가 비어 있습니다. test 경로와 파일명 형식을 확인하세요.")
+
+
+    norm_cache = Path(args.output_dir) / "norm_cache.json"
+    if norm_cache.exists():
+        cache = json.loads(norm_cache.read_text())
+        mean, std = cache["mean"], cache["std"]
+        print(f"[Step 1-2] cached mean={mean}, std={std}")
+    else:
+        train_image_paths = [r["path"] for r in train_records]
+        mean, std = calculate_mean_std(train_image_paths, args.image_size)
+        print(f"[Step 1-2] train mean={[f'{v:.4f}' for v in mean]}, std={[f'{v:.4f}' for v in std]}")
 
     # STEP 2) 라벨 커버리지 검증
     actual_style_count, actual_gender_count, actual_label_count = validate_label_coverage(train_records)
@@ -783,13 +741,13 @@ def run_single_training(
     index_to_gender = {idx: gender for gender, idx in gender_to_index.items()}
     index_to_label = {idx: label for label, idx in label_to_index.items()}
 
-    print("[Step 3] Build style label mapping")
+    print("[Step 3-1] 결합 라벨 매핑 생성")
     for idx in range(len(style_list)):
         print(f"  style[{idx}] = {index_to_style[idx]}")
-    print("[Step 3] Build gender label mapping")
+    print("[Step 3-2] 결합 라벨 매핑 생성")
     for idx in range(len(gender_list)):
         print(f"  gender[{idx}] = {index_to_gender[idx]}")
-    print("[Step 3] Build combined label mapping")
+    print("[Step 3-3] 결합 라벨 매핑 생성")
     for idx in range(len(label_list)):
         print(f"  class[{idx}] = {index_to_label[idx]}")
 
@@ -821,8 +779,8 @@ def run_single_training(
     ]
     dropped_test = len(test_records) - len(filtered_test_records)
     test_records = filtered_test_records
-    if args.val_dir and len(test_records) == 0:
-        raise ValueError("Test records became empty after label filtering.")
+    if args.test_dir and len(test_records) == 0:
+        raise ValueError("Test 레코드가 라벨 필터링 후 비었습니다.")
     if len(test_records) > 0:
         print_label_inventory(
             test_records,
@@ -830,7 +788,7 @@ def run_single_training(
         )
 
     # STEP 5) Dataset / DataLoader 생성
-    train_transform, val_transform = create_transforms(args.image_size)
+    train_transform, val_transform = create_transforms(args.image_size,mean,std)
     train_dataset = FashionStyleDataset(
         train_records,
         style_to_index=style_to_index,
@@ -916,7 +874,7 @@ def run_single_training(
         combined_index_lookup[key] = label_to_index[rec["label"]]
     unknown_combined_index = len(label_list)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -939,16 +897,15 @@ def run_single_training(
         f"train_samples={len(train_dataset)}, val_samples={len(val_dataset)}, "
         f"train_batches={len(train_loader)}, val_batches={len(val_loader)}, "
         f"batch_size={args.batch_size}, num_workers={args.num_workers}, "
-        f"train_val_split=7:3(label-stratified), dropout_p={args.dropout_p}, "
-        f"gender_loss_weight={args.gender_loss_weight}"
+        f"dropout_p={args.dropout_p}, gender_loss_weight={args.gender_loss_weight}"
     )
     if test_loader is not None:
         print(
             f"test_samples={len(test_dataset)}, test_batches={len(test_loader)} "
-            f"(final evaluation split from --val-dir)"
+            f"(final evaluation split from --test-dir)"
         )
     else:
-        print("[INFO] --val-dir(=test 경로)가 없어 final metrics는 validation split 기준으로 계산합니다.")
+        print("[INFO] --test-dir 미지정 → final metrics는 validation split 기준으로 계산합니다.")
     if len(train_dataset) > 0:
         print(f"example_train_file={train_dataset.samples[0]['path']}")
 
@@ -1076,7 +1033,7 @@ def run_single_training(
     best_model_path = output_dir / "best_model_state.pth"
     if not best_model_path.exists():
         raise FileNotFoundError(f"Best model checkpoint not found: {best_model_path}")
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
 
     final_eval_split = "test" if test_loader is not None else "val"
     final_eval_loader = test_loader if test_loader is not None else val_loader
@@ -1133,10 +1090,8 @@ def run_single_training(
         zero_division=0,
     )
 
-    combined_metric_labels = list(range(len(label_list) + 1))
-    combined_target_names = [
-        index_to_label[i] for i in range(len(label_list))
-    ] + ["__unknown_pair__"]
+    combined_metric_labels = list(range(len(label_list)))
+    combined_target_names  = [index_to_label[i] for i in range(len(label_list))]
     combined_accuracy = accuracy_score(
         final_eval_metrics["combined_labels"],
         final_eval_metrics["combined_preds"],
@@ -1350,12 +1305,17 @@ def run_single_training(
         "image_size": args.image_size,
         "batch_size": args.batch_size,
         "dropout_p": args.dropout_p,
+        "lr": args.lr,
+        "val_ratio": args.val_ratio,
         "gender_loss_weight": args.gender_loss_weight,
         "invalid_train_filenames": len(train_invalid),
         "invalid_val_filenames": len(val_invalid),
         "invalid_test_filenames": len(test_invalid),
         "dropped_val_labels_not_in_train": dropped_val,
         "dropped_test_labels_not_in_train": dropped_test,
+        "resize": f"({2 * args.image_size}, {args.image_size})",
+        "norm_mean": mean,
+        "norm_std" : std
     }
     with open(output_dir / "run_summary.json", "w", encoding="utf-8") as f:
         json.dump(run_summary, f, ensure_ascii=False, indent=2)
@@ -1390,7 +1350,6 @@ def run_single_training(
 
     return run_summary
 
-
 def run_training(args: argparse.Namespace) -> None:
     """
     멀티태스크 모델 학습 실행.
@@ -1405,38 +1364,46 @@ def run_training(args: argparse.Namespace) -> None:
     with open(base_output_dir / "multi_task_run_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-
 def build_arg_parser() -> argparse.ArgumentParser:
     """
     명령행 인자 정의.
     팀원이 경로/학습 설정을 코드 수정 없이 바꿀 수 있도록 모든 핵심 옵션을 노출합니다.
     """
     parser = argparse.ArgumentParser(
-        description="ResNet50 Fashion Style Training (classification + reusable feature extractor)"
+        description="ResNet50 Fashion Style Multi-Task Training (style + gender heads)"
     )
-    parser.add_argument("--train-dir", type=str, required=True, help="Train image directory")
     parser.add_argument(
-        "--val-dir",
-        type=str,
-        default="",
-        help="Test image directory. (기존 val-dir 인자 재사용)",
+        "--train-dir", type=str, required=True,
+        help="Train 이미지 경로",
+    )
+    parser.add_argument(
+        "--val-dir", type=str, default="",
+        help="Validation 이미지 경로. 비워두면 --val-ratio 기준으로 train에서 자동 분할",
+    )
+    parser.add_argument(
+        "--test-dir", type=str, default="",
+        help="Test 이미지 경로. 제공 시 best 모델로 최종 test 평가 수행",
+    )
+    parser.add_argument(
+        "--val-ratio", type=float, default=0.3,
+        help="val-dir 미지정 시 train에서 자동 분할할 비율 (기본 0.3 = 30%%)",
     )
     parser.add_argument("--image-size", type=int, default=224, help="입력 이미지 크기")
-    parser.add_argument("--batch-size", type=int, default=32, help="batch size (OOM 시 8/4 권장)")
+    parser.add_argument("--batch-size", type=int, default=32, help="배치 크기 (OOM 시 32/16 축소)")
     parser.add_argument("--num-epochs", type=int, default=30, help="학습 epoch")
     parser.add_argument("--patience", type=int, default=5, help="early stopping patience")
-    parser.add_argument("--lr", type=float, default=3e-4, help="learning rate")
+    parser.add_argument("--lr", type=float, default=1e-4, help="AdamW 학습률")
     parser.add_argument(
         "--dropout-p",
         type=float,
-        default=0.3,
+        default=0.2,
         help="분류 헤드 드롭아웃 확률 [0.0, 1.0).",
     )
     parser.add_argument(
         "--gender-loss-weight",
         type=float,
         default=0.3,
-        help="총 손실 = style_loss + gender_loss_weight * gender_loss",
+        help="총 손실 = style_loss + gender_loss_weight × gender_loss",
     )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument(
@@ -1460,14 +1427,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     return parser
 
-
 def main() -> None:
     # 프로그램 시작점: 인자 파싱 후 학습 실행
     parser = build_arg_parser()
     args = parser.parse_args()
     args.use_class_weights = not args.disable_class_weights
     run_training(args)
-
 
 if __name__ == "__main__":
     main()
