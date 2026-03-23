@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -7,6 +8,36 @@ from typing import Dict, List, Sequence, Tuple
 import pandas as pd
 import requests
 from PIL import Image
+
+STYLE_OPTIONS_MULTI_SCRATCH: List[str] = [
+    "athleisure",
+    "bodyconscious",
+    "bold",
+    "cityglam",
+    "classic",
+    "disco",
+    "ecology",
+    "feminine",
+    "genderless",
+    "grunge",
+    "hiphop",
+    "hippie",
+    "ivy",
+    "kitsch",
+    "lingerie",
+    "lounge",
+    "metrosexual",
+    "military",
+    "minimal",
+    "mods",
+    "normcore",
+    "oriental",
+    "popart",
+    "powersuit",
+    "punk",
+    "space",
+    "sportivecasual",
+]
 
 
 def normalize_gender(value: str) -> str:
@@ -16,13 +47,6 @@ def normalize_gender(value: str) -> str:
     if v in {"woman", "women", "w", "f", "female"}:
         return "female"
     return "all"
-
-
-def parse_csv_list(text: str) -> List[str]:
-    raw = str(text).strip()
-    if not raw:
-        return []
-    return [token.strip().lower() for token in raw.split(",") if token.strip()]
 
 
 def join_url(base: str, path: str) -> str:
@@ -72,56 +96,62 @@ class StreamlitApiRecommendationApp:
         st.caption("Calls backend /search endpoint and renders results")
 
         settings = self._render_sidebar()
-        style_options = self._resolve_style_options(settings)
-        self._render_main_ui(settings, style_options)
+        self._render_main_ui(settings, list(STYLE_OPTIONS_MULTI_SCRATCH))
 
     def _render_sidebar(self) -> Dict[str, object]:
         st = self.st
-        default_api_base = self._resolve_default("API_BASE_URL", "http://127.0.0.1:8000")
+        default_api_base = self._resolve_default("API_BASE_URL", "")
         default_search_path = self._resolve_default("SEARCH_PATH", "/search")
+        default_image_path_template = self._resolve_default("IMAGE_PATH_TEMPLATE", "/search_image/{item_id}")
+        default_image_id_query_key = self._resolve_default("IMAGE_ID_QUERY_KEY", "item_id")
         default_timeout = self._resolve_default_int("REQUEST_TIMEOUT_SEC", 60)
         default_verify_ssl = self._resolve_default_bool("VERIFY_SSL", True)
-        default_token = self._resolve_default("API_BEARER_TOKEN", "")
 
         with st.sidebar:
             st.subheader("API Settings")
-            api_base = st.text_input("API Base URL", value=default_api_base)
-            search_path = st.text_input("Search Path", value=default_search_path)
+            st.caption("사이드바 설정은 read-only입니다.")
+            api_base = st.text_input(
+                "API Base URL",
+                value=default_api_base,
+                disabled=True,
+            )
+            search_path = st.text_input(
+                "Search Path",
+                value=default_search_path,
+                disabled=True,
+            )
+            image_path_template = st.text_input(
+                "Image GET path template",
+                value=default_image_path_template,
+                help="예: /image/{item_id} 또는 /result-image (query key 사용)",
+                disabled=True,
+            )
+            image_id_query_key = st.text_input(
+                "Image id query key",
+                value=default_image_id_query_key,
+                help="path template에 {item_id}가 없을 때만 사용됩니다.",
+                disabled=True,
+            )
             timeout_sec = st.number_input(
                 "Request timeout (sec)",
                 min_value=5,
                 max_value=600,
                 value=max(5, min(600, int(default_timeout))),
                 step=5,
+                disabled=True,
             )
-            verify_ssl = st.checkbox("Verify SSL", value=default_verify_ssl)
-            preview_mode = st.checkbox("Preview mode (no API call)", value=False)
-
+            verify_ssl = st.checkbox("Verify SSL", value=default_verify_ssl, disabled=True)
+            preview_mode = st.checkbox("Preview mode (no API call)", value=False, disabled=True)
             st.divider()
-            st.subheader("Style Options")
-            auto_fetch_styles = st.checkbox("Fetch styles from API (/styles)", value=False)
-            style_csv = st.text_area(
-                "Manual style list (comma separated)",
-                value="casual,street,classic,minimal,sporty,formal,vintage",
-            )
-
-            st.divider()
-            st.subheader("Auth")
-            if default_token:
-                st.caption("Bearer token is loaded from secrets/env. (hidden)")
-            else:
-                st.caption("No bearer token configured in secrets/env.")
-            auth_token = default_token
 
         return {
             "api_base": str(api_base).strip(),
             "search_path": str(search_path).strip(),
+            "image_path_template": str(image_path_template).strip(),
+            "image_id_query_key": str(image_id_query_key).strip(),
             "timeout_sec": int(timeout_sec),
             "verify_ssl": bool(verify_ssl),
             "preview_mode": bool(preview_mode),
-            "auto_fetch_styles": bool(auto_fetch_styles),
-            "style_csv": str(style_csv),
-            "auth_token": str(auth_token).strip(),
         }
 
     def _resolve_default(self, key: str, fallback: str) -> str:
@@ -150,41 +180,6 @@ class StreamlitApiRecommendationApp:
             return False
         return bool(fallback)
 
-    def _resolve_style_options(self, settings: Dict[str, object]) -> List[str]:
-        manual = parse_csv_list(str(settings["style_csv"]))
-        if settings["preview_mode"] or not settings["auto_fetch_styles"]:
-            return manual if manual else ["casual", "street"]
-
-        st = self.st
-        styles_url = join_url(str(settings["api_base"]), "/styles")
-        headers: Dict[str, str] = {}
-        if settings["auth_token"]:
-            headers["Authorization"] = f"Bearer {settings['auth_token']}"
-
-        try:
-            resp = requests.get(
-                styles_url,
-                timeout=int(settings["timeout_sec"]),
-                verify=bool(settings["verify_ssl"]),
-                headers=headers or None,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            if isinstance(payload, list):
-                styles = [str(x).strip().lower() for x in payload if str(x).strip()]
-            elif isinstance(payload, dict):
-                raw = payload.get("styles", [])
-                styles = [str(x).strip().lower() for x in raw if str(x).strip()]
-            else:
-                styles = []
-
-            if styles:
-                return sorted(list(dict.fromkeys(styles)))
-            return manual if manual else ["casual", "street"]
-        except Exception as exc:
-            st.warning(f"Failed to fetch /styles. Fallback to manual list. ({exc})")
-            return manual if manual else ["casual", "street"]
-
     def _build_request(
         self,
         uploaded,
@@ -209,10 +204,97 @@ class StreamlitApiRecommendationApp:
         }
 
         headers: Dict[str, str] = {}
-        if settings["auth_token"]:
-            headers["Authorization"] = f"Bearer {settings['auth_token']}"
-
+        
         return url, files, data, headers
+
+    def _extract_item_id(self, item: Dict[str, object]) -> str:
+        for key in ("item_id", "image_id", "id", "image_key"):
+            value = item.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    def _format_score(self, value: object) -> str:
+        try:
+            return f"{float(value):.4f}"
+        except Exception:
+            return str(value) if value is not None else "-"
+
+    def _build_image_get_target(
+        self,
+        item: Dict[str, object],
+        settings: Dict[str, object],
+    ) -> Tuple[str, Dict[str, str]]:
+        item_id = self._extract_item_id(item)
+        if not item_id:
+            return "", {}
+
+        template = str(settings["image_path_template"]).strip() or "/search_image/{item_id}"
+        has_item_placeholder = "{item_id}" in template
+
+        rendered_path = template
+        rendered_path = rendered_path.replace("{item_id}", item_id)
+        rendered_path = rendered_path.replace("{split}", str(item.get("split", "")).strip())
+        rendered_path = rendered_path.replace(
+            "{source_root_name}",
+            str(item.get("source_root_name", "")).strip(),
+        )
+
+        params: Dict[str, str] = {}
+        if not has_item_placeholder:
+            query_key = str(settings.get("image_id_query_key", "item_id")).strip() or "item_id"
+            params[query_key] = item_id
+
+        return join_url(str(settings["api_base"]), rendered_path), params
+
+    def _fetch_result_image(
+        self,
+        item: Dict[str, object],
+        settings: Dict[str, object],
+        headers: Dict[str, str],
+    ) -> Tuple[object, str]:
+        direct_ref = get_image_ref(item)
+        if direct_ref:
+            return direct_ref, ""
+
+        url, params = self._build_image_get_target(item, settings)
+        if not url:
+            return None, "item_id를 찾을 수 없어 이미지 GET 요청을 만들 수 없습니다."
+
+        try:
+            resp = requests.get(
+                url,
+                params=params or None,
+                timeout=int(settings["timeout_sec"]),
+                verify=bool(settings["verify_ssl"]),
+                headers=headers or None,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            return None, f"image GET 실패: {exc}"
+
+        content_type = str(resp.headers.get("content-type", "")).lower()
+        if content_type.startswith("image/"):
+            try:
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                return img, ""
+            except Exception as exc:
+                return None, f"이미지 디코딩 실패: {exc}"
+
+        try:
+            payload = resp.json()
+        except Exception:
+            return None, f"지원하지 않는 응답 타입: {content_type or 'unknown'}"
+
+        if isinstance(payload, dict):
+            ref = get_image_ref(payload)
+            if ref:
+                return ref, ""
+
+        return None, "이미지 URL/경로를 응답에서 찾지 못했습니다."
 
     def _render_main_ui(self, settings: Dict[str, object], style_options: List[str]) -> None:
         st = self.st
@@ -227,8 +309,43 @@ class StreamlitApiRecommendationApp:
         with col3:
             fallback_fill = st.checkbox("fallback_fill", value=True)
 
-        preferred_styles = st.multiselect("Preferred styles", options=style_options)
-        disliked_styles = st.multiselect("Disliked styles", options=style_options)
+        # 선호/비선호 스타일은 서로 중복 선택되지 않도록 session_state를 정리합니다.
+        preferred_key = "preferred_styles"
+        disliked_key = "disliked_styles"
+
+        preferred_existing = [
+            s for s in st.session_state.get(preferred_key, [])
+            if s in style_options
+        ]
+        disliked_existing = [
+            s for s in st.session_state.get(disliked_key, [])
+            if s in style_options
+        ]
+
+        # 초기 충돌이 있으면 preferred를 우선 유지하고 disliked에서 제거합니다.
+        disliked_existing = [s for s in disliked_existing if s not in preferred_existing]
+        st.session_state[preferred_key] = preferred_existing
+        st.session_state[disliked_key] = disliked_existing
+
+        preferred_options = [s for s in style_options if s not in disliked_existing]
+        st.session_state[preferred_key] = [
+            s for s in st.session_state[preferred_key] if s in preferred_options
+        ]
+        preferred_styles = st.multiselect(
+            "Preferred styles",
+            options=preferred_options,
+            key=preferred_key,
+        )
+
+        disliked_options = [s for s in style_options if s not in preferred_styles]
+        st.session_state[disliked_key] = [
+            s for s in st.session_state[disliked_key] if s in disliked_options
+        ]
+        disliked_styles = st.multiselect(
+            "Disliked styles",
+            options=disliked_options,
+            key=disliked_key,
+        )
 
         if not st.button("Run search", type="primary"):
             return
@@ -286,34 +403,75 @@ class StreamlitApiRecommendationApp:
             score = row.get("score", row.get("similarity", ""))
             style = row.get("style", "")
             gender = row.get("gender", "")
-            image_key = row.get("image_key", row.get("image_id", row.get("id", "")))
-            image_ref = get_image_ref(row)
+            item_id = self._extract_item_id(row)
+            split = row.get("split", "")
+            source_root_name = row.get("source_root_name", "")
+            label = row.get("label", "")
+            original_path = row.get("original_path", "")
             normalized_rows.append(
                 {
                     "rank": rank,
                     "score": score,
+                    "cosine_similarity": score,
+                    "item_id": item_id,
                     "style": style,
                     "gender": gender,
-                    "image_key": image_key,
-                    "image_ref": image_ref,
+                    "label": label,
+                    "split": split,
+                    "source_root_name": source_root_name,
+                    "original_path": original_path,
+                    "_raw_item": row,
                 }
             )
 
-        result_df = pd.DataFrame(normalized_rows)
+        result_df = pd.DataFrame(
+            [
+                {
+                    "rank": row["rank"],
+                    "cosine_similarity": row["cosine_similarity"],
+                    "item_id": row["item_id"],
+                    "style": row["style"],
+                    "gender": row["gender"],
+                    "label": row["label"],
+                    "split": row["split"],
+                }
+                for row in normalized_rows
+            ]
+        )
         st.subheader("Top-K results")
         st.dataframe(result_df, use_container_width=True)
 
-        for _, row in result_df.head(5).iterrows():
-            ref = str(row.get("image_ref", "")).strip()
-            if not ref:
-                continue
-            caption = f"rank={row['rank']}, score={row['score']}"
-            if ref.startswith(("http://", "https://")):
-                st.image(ref, caption=caption, width=260)
-            else:
-                p = Path(ref)
-                if p.exists():
-                    st.image(str(p), caption=caption, width=260)
+        st.subheader("Recommendation gallery")
+        gallery_cols = st.columns(3)
+        for idx, item in enumerate(normalized_rows):
+            col = gallery_cols[idx % 3]
+            with col:
+                image_obj, error_text = self._fetch_result_image(
+                    item=item["_raw_item"],
+                    settings=settings,
+                    headers=headers,
+                )
+                if image_obj is not None:
+                    if isinstance(image_obj, str):
+                        if image_obj.startswith(("http://", "https://")):
+                            st.image(image_obj, use_container_width=True)
+                        else:
+                            p = Path(image_obj)
+                            if p.exists():
+                                st.image(str(p), use_container_width=True)
+                            else:
+                                st.warning(f"이미지 경로를 찾지 못했습니다: {image_obj}")
+                    else:
+                        st.image(image_obj, use_container_width=True)
+                else:
+                    st.warning(error_text)
+
+                st.markdown(f"**Rank #{item['rank']}**")
+                st.caption(f"Cosine similarity: {self._format_score(item['score'])}")
+                st.caption(
+                    f"item_id={item['item_id']} | style={item['style']} | "
+                    f"gender={item['gender']}"
+                )
 
     def _render_preview_results(
         self,
@@ -337,10 +495,10 @@ class StreamlitApiRecommendationApp:
                 {
                     "rank": rank,
                     "score": float(max(0.0, 1.0 - 0.03 * (rank - 1))),
+                    "cosine_similarity": float(max(0.0, 1.0 - 0.03 * (rank - 1))),
                     "style": style,
                     "gender": gender,
-                    "image_key": f"preview_{rank:03d}",
-                    "image_ref": "",
+                    "item_id": f"preview_{rank:03d}",
                 }
             )
 
