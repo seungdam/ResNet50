@@ -305,7 +305,7 @@ class StreamlitApiRecommendationApp:
         with col1:
             gender_filter = st.selectbox("Gender", ["all", "male", "female"], index=0)
         with col2:
-            top_k = st.slider("Top-K", min_value=1, max_value=50, value=5, step=1)
+            top_k = st.slider("Top-K", min_value=1, max_value=5, value=5, step=1)
         with col3:
             fallback_fill = st.checkbox("fallback_fill", value=True)
 
